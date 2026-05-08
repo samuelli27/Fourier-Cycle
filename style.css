@@ -173,6 +173,29 @@ button {
   background: #88d8ff;
 }
 
+#portrait-btn {
+  background: transparent;
+  border: 1px solid #2a2a44;
+  color: #888;
+  padding: 0.55rem 1.1rem;
+}
+
+#portrait-btn:hover:not(:disabled) {
+  border-color: #64c8ff;
+  color: #64c8ff;
+}
+
+#portrait-btn.active {
+  background: #64c8ff;
+  color: #0a0a14;
+  border-color: #64c8ff;
+}
+
+#portrait-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 #back-btn {
   background: transparent;
   border: 1px solid #2a2a44;

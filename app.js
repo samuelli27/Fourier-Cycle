@@ -15,6 +15,12 @@ let cannyThreshold = 80;
 
 let dftWorker = null;
 
+// Portrait mode (MediaPipe selfie segmentation)
+let loadedImage = null;
+let portraitMode = false;
+let segmenter = null;
+let segmenterLoading = null;
+
 const ANIM_STEPS = 600; // unified path resolution across all contours
 
 // Color palette — one hue per contour for paths and epicycles
@@ -47,6 +53,7 @@ const cannySlider    = document.getElementById('canny-slider');
 const cannyVal       = document.getElementById('canny-val');
 const progressBar    = document.getElementById('dft-progress');
 const progressWrap   = document.getElementById('dft-progress-wrap');
+const portraitBtn    = document.getElementById('portrait-btn');
 const animateBtn     = document.getElementById('animate-btn');
 const backBtn        = document.getElementById('back-btn');
 const startBtn       = document.getElementById('start-btn');
@@ -98,12 +105,17 @@ function loadImageToCanvas(img) {
     h = Math.round(h * scale);
   }
   canvasW = w; canvasH = h;
+  loadedImage = img;
 
   previewCanvas.width = w;  previewCanvas.height = h;
   previewCtx.drawImage(img, 0, 0, w, h);
 
   originalCanvas.width = w; originalCanvas.height = h;
   originalCtx.drawImage(img, 0, 0, w, h);
+
+  // Reset portrait mode on new upload
+  portraitMode = false;
+  portraitBtn.classList.remove('active');
 
   runContourPreview();
 }
@@ -115,6 +127,93 @@ cannySlider.addEventListener('input', () => {
   cannyVal.textContent = cannyThreshold;
   runContourPreview();
 });
+
+portraitBtn.addEventListener('click', async () => {
+  if (!loadedImage) { setStatus('Upload an image first.'); return; }
+  portraitMode = !portraitMode;
+  portraitBtn.classList.toggle('active', portraitMode);
+  portraitBtn.disabled = true;
+  try {
+    // Reset preview to original each time
+    previewCtx.drawImage(loadedImage, 0, 0, canvasW, canvasH);
+    if (portraitMode) await applyPortraitMask();
+    runContourPreview();
+  } catch (err) {
+    console.error(err);
+    portraitMode = false;
+    portraitBtn.classList.remove('active');
+    previewCtx.drawImage(loadedImage, 0, 0, canvasW, canvasH);
+    setStatus(err.message || 'Portrait detection failed.');
+    runContourPreview();
+  } finally {
+    portraitBtn.disabled = false;
+  }
+});
+
+// ─── Portrait mode: MediaPipe Selfie Segmentation ─────────────────────────
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.crossOrigin = 'anonymous';
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('Failed to load ' + src));
+    document.head.appendChild(s);
+  });
+}
+
+async function ensureSegmenter() {
+  if (segmenter) return segmenter;
+  if (segmenterLoading) return segmenterLoading;
+  segmenterLoading = (async () => {
+    setStatus('Loading portrait model (one-time, ~3MB)…');
+    if (!window.SelfieSegmentation) {
+      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js');
+    }
+    const seg = new SelfieSegmentation({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
+    });
+    seg.setOptions({ modelSelection: 1 }); // landscape model — fast, good for framed subjects
+    await seg.initialize();
+    segmenter = seg;
+    return segmenter;
+  })();
+  return segmenterLoading;
+}
+
+async function applyPortraitMask() {
+  setStatus('Detecting person…');
+  const seg = await ensureSegmenter();
+  setStatus('Detecting person…');
+
+  const results = await new Promise((resolve) => {
+    seg.onResults(resolve);
+    seg.send({ image: previewCanvas });
+  });
+
+  // Read the soft mask into pixel data
+  const maskCanvas = document.createElement('canvas');
+  maskCanvas.width = canvasW;
+  maskCanvas.height = canvasH;
+  const maskCtx = maskCanvas.getContext('2d');
+  maskCtx.drawImage(results.segmentationMask, 0, 0, canvasW, canvasH);
+  const maskData = maskCtx.getImageData(0, 0, canvasW, canvasH).data;
+
+  // Replace background pixels with white — sharp silhouette edge for Canny,
+  // no spurious edges from the original background.
+  const imgData = previewCtx.getImageData(0, 0, canvasW, canvasH);
+  let personPixels = 0;
+  for (let i = 0; i < imgData.data.length; i += 4) {
+    if (maskData[i] < 128) {
+      imgData.data[i] = 255; imgData.data[i+1] = 255; imgData.data[i+2] = 255;
+    } else {
+      personPixels++;
+    }
+  }
+  if (personPixels < 200) throw new Error('No person detected — try another image.');
+  previewCtx.putImageData(imgData, 0, 0);
+}
 
 function runContourPreview() {
   setStatus('Detecting outlines…');
