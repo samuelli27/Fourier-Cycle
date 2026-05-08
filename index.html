@@ -11,7 +11,7 @@
     <header>
       <h1>Fourier Cycle</h1>
       <p>Upload a photo to watch it drawn by rotating circles</p>
-      <div class="version-badge">v9 · Multi-contour: internal details traced with separate epicycle chains</div>
+      <div class="version-badge">v10 · Portrait mode: AI removes the background so humans trace sharply</div>
     </header>
 
     <div class="upload-zone" id="upload-zone">
@@ -39,6 +39,7 @@
           <label>Edge sensitivity: <span id="canny-val">80</span></label>
           <input type="range" id="canny-slider" min="10" max="200" value="80">
         </div>
+        <button id="portrait-btn" title="Use AI to detect a person and remove the background">👤 Portrait</button>
         <button id="animate-btn">Animate this shape →</button>
       </div>
       <div id="dft-progress-wrap" class="hidden">
