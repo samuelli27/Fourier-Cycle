@@ -114,30 +114,29 @@ function extractContour(w, h) {
 
   const blurred = gaussianBlur(gray, w, h);
   const mag = sobelMagnitude(blurred, w, h);
-  const threshold = adaptiveThreshold(mag, MAX_POINTS * 2);
+
+  // Threshold to keep roughly 3× MAX_POINTS edge pixels before filtering
+  const threshold = adaptiveThreshold(mag, MAX_POINTS * 3);
+  const edgeMap = new Uint8Array(w * h);
+  for (let i = 0; i < mag.length; i++) edgeMap[i] = mag[i] > threshold ? 1 : 0;
+
+  // Keep only the largest connected blob — drops scattered texture noise
+  const component = largestConnectedComponent(edgeMap, w, h);
 
   const edgePixels = [];
-  for (let y = 2; y < h - 2; y++) {
-    for (let x = 2; x < w - 2; x++) {
-      if (mag[y * w + x] > threshold) edgePixels.push({ x, y });
-    }
+  for (let i = 0; i < w * h; i++) {
+    if (component[i]) edgePixels.push({ x: i % w, y: Math.floor(i / w) });
   }
+  if (edgePixels.length < 3) return [];
 
-  if (edgePixels.length === 0) return [];
-
-  // Subsample to MAX_POINTS
-  const step = Math.max(1, Math.floor(edgePixels.length / MAX_POINTS));
-  const sampled = [];
-  for (let i = 0; i < edgePixels.length && sampled.length < MAX_POINTS; i += step) {
-    sampled.push(edgePixels[i]);
-  }
-
-  const ordered = nearestNeighborPath(sampled);
+  // Sort by angle around centroid — turns the pixel set into an ordered ring
+  const ordered = sortByAngle(edgePixels);
+  const resampled = resampleEvenly(ordered, MAX_POINTS);
 
   // Center at origin
-  const cx = ordered.reduce((s, p) => s + p.x, 0) / ordered.length;
-  const cy = ordered.reduce((s, p) => s + p.y, 0) / ordered.length;
-  return ordered.map(p => ({ x: p.x - cx, y: p.y - cy }));
+  const cx = resampled.reduce((s, p) => s + p.x, 0) / resampled.length;
+  const cy = resampled.reduce((s, p) => s + p.y, 0) / resampled.length;
+  return resampled.map(p => ({ x: p.x - cx, y: p.y - cy }));
 }
 
 function gaussianBlur(gray, w, h) {
@@ -186,22 +185,75 @@ function adaptiveThreshold(mag, targetCount) {
   return vals[idx];
 }
 
-function nearestNeighborPath(points) {
-  if (points.length <= 1) return points;
-  const remaining = points.slice();
-  const result = [remaining.splice(0, 1)[0]];
+// BFS flood-fill — returns a binary map containing only the largest
+// 8-connected component of edgeMap, discarding scattered noise pixels.
+function largestConnectedComponent(edgeMap, w, h) {
+  const visited = new Uint8Array(w * h);
+  let bestStart = -1, bestSize = 0;
 
-  while (remaining.length > 0) {
-    const last = result[result.length - 1];
-    let minDist = Infinity, minIdx = 0;
-    for (let i = 0; i < remaining.length; i++) {
-      const dx = remaining[i].x - last.x;
-      const dy = remaining[i].y - last.y;
-      const d = dx * dx + dy * dy;
-      if (d < minDist) { minDist = d; minIdx = i; }
+  for (let i = 0; i < w * h; i++) {
+    if (!edgeMap[i] || visited[i]) continue;
+    // BFS to measure component size
+    const queue = [i];
+    visited[i] = 1;
+    let size = 0;
+    while (queue.length > 0) {
+      const idx = queue.pop();
+      size++;
+      const y = Math.floor(idx / w), x = idx % w;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dy === 0 && dx === 0) continue;
+          const ny = y + dy, nx = x + dx;
+          if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
+          const ni = ny * w + nx;
+          if (edgeMap[ni] && !visited[ni]) { visited[ni] = 1; queue.push(ni); }
+        }
+      }
     }
-    result.push(remaining.splice(minIdx, 1)[0]);
+    if (size > bestSize) { bestSize = size; bestStart = i; }
   }
+
+  if (bestStart === -1) return new Uint8Array(w * h);
+
+  // Second BFS to collect the winning component
+  const result = new Uint8Array(w * h);
+  const visited2 = new Uint8Array(w * h);
+  const queue = [bestStart];
+  visited2[bestStart] = 1;
+  while (queue.length > 0) {
+    const idx = queue.pop();
+    result[idx] = 1;
+    const y = Math.floor(idx / w), x = idx % w;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dy === 0 && dx === 0) continue;
+        const ny = y + dy, nx = x + dx;
+        if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
+        const ni = ny * w + nx;
+        if (edgeMap[ni] && !visited2[ni]) { visited2[ni] = 1; queue.push(ni); }
+      }
+    }
+  }
+  return result;
+}
+
+// Sort edge pixels by angle from their centroid, turning the pixel set
+// into an ordered ring suitable for DFT.
+function sortByAngle(points) {
+  const cx = points.reduce((s, p) => s + p.x, 0) / points.length;
+  const cy = points.reduce((s, p) => s + p.y, 0) / points.length;
+  return [...points].sort(
+    (a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx)
+  );
+}
+
+// Pick N evenly-spaced points from a path array.
+function resampleEvenly(path, n) {
+  if (path.length <= n) return path;
+  const result = [];
+  const step = path.length / n;
+  for (let i = 0; i < n; i++) result.push(path[Math.floor(i * step)]);
   return result;
 }
 
