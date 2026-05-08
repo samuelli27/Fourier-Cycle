@@ -11,7 +11,7 @@
     <header>
       <h1>Fourier Cycle</h1>
       <p>Upload a photo to watch it drawn by rotating circles</p>
-      <div class="version-badge">v6 · Path pre-computed upfront so animation always runs to completion</div>
+      <div class="version-badge">v8 · Adaptive N from contour complexity, async DFT with progress</div>
     </header>
 
     <div class="upload-zone" id="upload-zone">
@@ -22,31 +22,60 @@
 
     <div class="status" id="status"></div>
 
-    <div class="controls" id="controls">
-      <div class="control-group">
-        <label>Circles: <span id="num-circles-val">100</span></label>
-        <input type="range" id="num-circles" min="1" max="500" value="100">
+    <!-- Step 1: Contour review -->
+    <div id="contour-section" class="hidden">
+      <div class="canvases">
+        <div class="canvas-wrapper">
+          <div class="canvas-label">Original</div>
+          <canvas id="preview-canvas"></canvas>
+        </div>
+        <div class="canvas-wrapper">
+          <div class="canvas-label">Detected outline</div>
+          <canvas id="contour-canvas"></canvas>
+        </div>
       </div>
-      <div class="control-group">
-        <label>Speed: <span id="speed-val">1x</span></label>
-        <input type="range" id="speed" min="0.25" max="4" step="0.25" value="1">
+      <div class="review-bar">
+        <div class="control-group">
+          <label>Edge sensitivity: <span id="canny-val">80</span></label>
+          <input type="range" id="canny-slider" min="10" max="200" value="80">
+        </div>
+        <button id="animate-btn">Animate this shape →</button>
       </div>
-      <div class="buttons">
-        <button id="start-btn" disabled>Start</button>
-        <button id="reset-btn" disabled>Reset</button>
+      <div id="dft-progress-wrap" class="hidden">
+        <progress id="dft-progress" max="100" value="0"></progress>
+        <span class="progress-label">Computing Fourier transform…</span>
       </div>
     </div>
 
-    <div class="canvases" id="canvases">
-      <div class="canvas-wrapper">
-        <div class="canvas-label">Original</div>
-        <canvas id="preview-canvas"></canvas>
+    <!-- Step 2: Animation -->
+    <div id="anim-section" class="hidden">
+      <div class="canvases">
+        <div class="canvas-wrapper">
+          <div class="canvas-label">Original</div>
+          <canvas id="original-canvas"></canvas>
+        </div>
+        <div class="canvas-wrapper">
+          <div class="canvas-label">Fourier Animation</div>
+          <canvas id="anim-canvas"></canvas>
+        </div>
       </div>
-      <div class="canvas-wrapper">
-        <div class="canvas-label">Fourier Animation</div>
-        <canvas id="anim-canvas"></canvas>
+      <div class="controls">
+        <div class="control-group">
+          <label>Circles: <span id="num-circles-val">100</span></label>
+          <input type="range" id="num-circles" min="1" max="500" value="100">
+        </div>
+        <div class="control-group">
+          <label>Speed: <span id="speed-val">1x</span></label>
+          <input type="range" id="speed" min="0.25" max="4" step="0.25" value="1">
+        </div>
+        <div class="buttons">
+          <button id="back-btn">← Adjust outline</button>
+          <button id="start-btn" disabled>Start</button>
+          <button id="reset-btn" disabled>Reset</button>
+        </div>
       </div>
     </div>
+
   </div>
   <script async src="https://docs.opencv.org/4.10.0/opencv.js" onload="onOpenCvReady()"></script>
   <script src="app.js"></script>
