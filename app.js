@@ -20,6 +20,7 @@ let loadedImage = null;
 let portraitMode = false;
 let segmenter = null;
 let segmenterLoading = null;
+let portraitMaskCanvas = null; // raw grayscale segmentation mask, used directly by extractContours
 
 const ANIM_STEPS = 600; // unified path resolution across all contours
 
@@ -115,6 +116,7 @@ function loadImageToCanvas(img) {
 
   // Reset portrait mode on new upload
   portraitMode = false;
+  portraitMaskCanvas = null;
   portraitBtn.classList.remove('active');
 
   runContourPreview();
@@ -136,7 +138,11 @@ portraitBtn.addEventListener('click', async () => {
   try {
     // Reset preview to original each time
     previewCtx.drawImage(loadedImage, 0, 0, canvasW, canvasH);
-    if (portraitMode) await applyPortraitMask();
+    if (portraitMode) {
+      await applyPortraitMask();
+    } else {
+      portraitMaskCanvas = null;
+    }
     runContourPreview();
   } catch (err) {
     console.error(err);
@@ -192,11 +198,11 @@ async function applyPortraitMask() {
     seg.send({ image: previewCanvas });
   });
 
-  // Read the soft mask into pixel data
-  const maskCanvas = document.createElement('canvas');
-  maskCanvas.width = canvasW;
-  maskCanvas.height = canvasH;
-  const maskCtx = maskCanvas.getContext('2d');
+  // Save the raw mask so extractContours can use it directly as a clean silhouette source
+  if (!portraitMaskCanvas) portraitMaskCanvas = document.createElement('canvas');
+  portraitMaskCanvas.width = canvasW;
+  portraitMaskCanvas.height = canvasH;
+  const maskCtx = portraitMaskCanvas.getContext('2d');
   maskCtx.drawImage(results.segmentationMask, 0, 0, canvasW, canvasH);
   const maskData = maskCtx.getImageData(0, 0, canvasW, canvasH).data;
 
@@ -301,6 +307,7 @@ backBtn.addEventListener('click', () => {
 // ─── Contour extraction via OpenCV.js ──────────────────────────────────────
 
 function extractContours(highThreshold = 80) {
+  if (portraitMode && portraitMaskCanvas) return extractContoursPortrait(highThreshold);
   let src, gray, blurred, edges, contoursMat, hierarchy;
   try {
     src        = cv.imread(previewCanvas);
@@ -349,6 +356,98 @@ function extractContours(highThreshold = 80) {
   } finally {
     src?.delete(); gray?.delete(); blurred?.delete();
     edges?.delete(); contoursMat?.delete(); hierarchy?.delete();
+  }
+}
+
+// Portrait-aware extraction: silhouette comes directly from the segmentation mask
+// (one perfect closed loop), and internal details come from Canny within the
+// eroded mask region (face, clothing folds, etc.).
+function extractContoursPortrait(highThreshold) {
+  let maskSrc, maskGray, maskBin, maskClean, maskEroded, kernel;
+  let imgSrc, imgGray, imgBlur, imgEdges, edgesInside;
+  let silContours, silHier, intContours, intHier;
+  try {
+    // ── Clean binary mask ──
+    maskSrc = cv.imread(portraitMaskCanvas);
+    maskGray = new cv.Mat();
+    cv.cvtColor(maskSrc, maskGray, cv.COLOR_RGBA2GRAY);
+    maskBin = new cv.Mat();
+    cv.threshold(maskGray, maskBin, 128, 255, cv.THRESH_BINARY);
+    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7, 7));
+    maskClean = new cv.Mat();
+    cv.morphologyEx(maskBin, maskClean, cv.MORPH_CLOSE, kernel);
+    cv.morphologyEx(maskClean, maskClean, cv.MORPH_OPEN, kernel);
+
+    // ── Silhouette contour straight from the mask ──
+    silContours = new cv.MatVector();
+    silHier = new cv.Mat();
+    cv.findContours(maskClean, silContours, silHier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
+    let silIdx = -1, silLen = 0;
+    for (let i = 0; i < silContours.size(); i++) {
+      const len = silContours.get(i).rows;
+      if (len > silLen) { silLen = len; silIdx = i; }
+    }
+    if (silIdx === -1) return [];
+
+    const ox = canvasW / 2, oy = canvasH / 2;
+    const silMat = silContours.get(silIdx);
+    const silPts = [];
+    for (let i = 0; i < silMat.rows; i++) {
+      silPts.push({ x: silMat.data32S[i * 2] - ox, y: silMat.data32S[i * 2 + 1] - oy });
+    }
+
+    // ── Internal edges: Canny on the masked image, then keep only edges
+    //    well inside the silhouette so we don't double-trace the outline ──
+    maskEroded = new cv.Mat();
+    cv.erode(maskClean, maskEroded, kernel, new cv.Point(-1, -1), 4);
+
+    imgSrc = cv.imread(previewCanvas);
+    imgGray = new cv.Mat();
+    cv.cvtColor(imgSrc, imgGray, cv.COLOR_RGBA2GRAY);
+    imgBlur = new cv.Mat();
+    cv.GaussianBlur(imgGray, imgBlur, new cv.Size(5, 5), 0);
+    imgEdges = new cv.Mat();
+    cv.Canny(imgBlur, imgEdges, highThreshold / 2, highThreshold);
+    edgesInside = new cv.Mat();
+    cv.bitwise_and(imgEdges, maskEroded, edgesInside);
+
+    intContours = new cv.MatVector();
+    intHier = new cv.Mat();
+    cv.findContours(edgesInside, intContours, intHier, cv.RETR_LIST, cv.CHAIN_APPROX_NONE);
+
+    const MIN_LEN = 20;
+    const MAX_INTERNAL = 7; // 7 internal + 1 silhouette = 8 total contours
+    const candidates = [];
+    for (let i = 0; i < intContours.size(); i++) {
+      const len = intContours.get(i).rows;
+      if (len >= MIN_LEN) candidates.push({ i, len });
+    }
+    candidates.sort((a, b) => b.len - a.len);
+    const chosen = candidates.slice(0, MAX_INTERNAL);
+
+    const internalPts = chosen.map(({ i }) => {
+      const c = intContours.get(i);
+      const pts = [];
+      for (let j = 0; j < c.rows; j++) {
+        pts.push({ x: c.data32S[j * 2] - ox, y: c.data32S[j * 2 + 1] - oy });
+      }
+      return pts;
+    });
+
+    // Budget N_MAX across silhouette + internal proportionally
+    const all = [silPts, ...internalPts];
+    const totalLen = all.reduce((s, c) => s + c.length, 0);
+    return all.map(pts => {
+      const n = totalLen <= N_MAX
+        ? pts.length
+        : Math.max(MIN_LEN, Math.floor(N_MAX * pts.length / totalLen));
+      return n < pts.length ? resampleEvenly(pts, n) : pts;
+    });
+
+  } finally {
+    [maskSrc, maskGray, maskBin, maskClean, maskEroded, kernel,
+     imgSrc, imgGray, imgBlur, imgEdges, edgesInside,
+     silContours, silHier, intContours, intHier].forEach(m => m?.delete?.());
   }
 }
 
