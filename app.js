@@ -1,15 +1,15 @@
 const MAX_POINTS = 512;
-const TARGET_FRAMES = 400; // frames per cycle at speed=1
 
+let cvReady = false;
 let animationId = null;
 let frequencies = [];
-let drawnPath = [];
-let timeStep = 0;
+let precomputedPath = []; // all path points computed upfront
+let animFrame = 0;        // index into precomputedPath
+let stepsAccumulator = 0;
 let numCircles = 100;
 let speed = 1;
 let canvasW = 0;
 let canvasH = 0;
-let dt = 0;
 
 const uploadZone = document.getElementById('upload-zone');
 const fileInput = document.getElementById('file-input');
@@ -24,6 +24,14 @@ const numCirclesVal = document.getElementById('num-circles-val');
 const speedVal = document.getElementById('speed-val');
 const startBtn = document.getElementById('start-btn');
 const resetBtn = document.getElementById('reset-btn');
+
+// Called by the opencv.js onload attribute
+function onOpenCvReady() {
+  cvReady = true;
+  setStatus('Ready — upload an image to begin.');
+}
+
+setStatus('Loading OpenCV.js…');
 
 uploadZone.addEventListener('click', () => fileInput.click());
 uploadZone.addEventListener('dragover', e => {
@@ -55,6 +63,7 @@ startBtn.addEventListener('click', startAnimation);
 resetBtn.addEventListener('click', resetAnimation);
 
 function handleFile(file) {
+  if (!cvReady) { setStatus('Still loading OpenCV.js — please wait a moment.'); return; }
   resetAnimation();
   startBtn.disabled = true;
   const reader = new FileReader();
@@ -80,14 +89,14 @@ function loadImageToCanvas(img) {
   previewCanvas.height = h;
   previewCtx.drawImage(img, 0, 0, w, h);
 
-  setStatus('Detecting edges...');
+  setStatus('Detecting contour…');
   setTimeout(() => {
-    const points = extractContour(w, h);
+    const points = extractContour();
     if (points.length < 3) {
-      setStatus('Could not find clear edges. Try a higher-contrast image.');
+      setStatus('No clear contour found. Try a higher-contrast image.');
       return;
     }
-    setStatus(`Computing Fourier transform for ${points.length} points...`);
+    setStatus(`Computing DFT for ${points.length} points…`);
     setTimeout(() => {
       frequencies = computeDFT(points);
       const maxCircles = Math.min(500, frequencies.length);
@@ -95,160 +104,59 @@ function loadImageToCanvas(img) {
       numCircles = Math.min(numCircles, maxCircles);
       numCirclesSlider.value = numCircles;
       numCirclesVal.textContent = numCircles;
-      setStatus(`Ready — ${points.length} edge points. Click Start.`);
+      setStatus(`Ready — ${points.length} contour points. Click Start.`);
       startBtn.disabled = false;
     }, 20);
   }, 20);
 }
 
-// ─── Image Processing ──────────────────────────────────────────────────────
+// ─── Contour extraction via OpenCV.js ──────────────────────────────────────
 
-function extractContour(w, h) {
-  const imageData = previewCtx.getImageData(0, 0, w, h);
-  const data = imageData.data;
+function extractContour() {
+  let src, gray, blurred, edges, contours, hierarchy;
+  try {
+    src       = cv.imread(previewCanvas);
+    gray      = new cv.Mat();
+    blurred   = new cv.Mat();
+    edges     = new cv.Mat();
+    contours  = new cv.MatVector();
+    hierarchy = new cv.Mat();
 
-  const gray = new Float32Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
-  }
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+    cv.Canny(blurred, edges, 50, 150);
+    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
 
-  const blurred = gaussianBlur(gray, w, h);
-  const mag = sobelMagnitude(blurred, w, h);
-
-  // Threshold to keep roughly 3× MAX_POINTS edge pixels before filtering
-  const threshold = adaptiveThreshold(mag, MAX_POINTS * 3);
-  const edgeMap = new Uint8Array(w * h);
-  for (let i = 0; i < mag.length; i++) edgeMap[i] = mag[i] > threshold ? 1 : 0;
-
-  // Keep only the largest connected blob — drops scattered texture noise
-  const component = largestConnectedComponent(edgeMap, w, h);
-
-  const edgePixels = [];
-  for (let i = 0; i < w * h; i++) {
-    if (component[i]) edgePixels.push({ x: i % w, y: Math.floor(i / w) });
-  }
-  if (edgePixels.length < 3) return [];
-
-  // Sort by angle around centroid — turns the pixel set into an ordered ring
-  const ordered = sortByAngle(edgePixels);
-  const resampled = resampleEvenly(ordered, MAX_POINTS);
-
-  // Center at origin
-  const cx = resampled.reduce((s, p) => s + p.x, 0) / resampled.length;
-  const cy = resampled.reduce((s, p) => s + p.y, 0) / resampled.length;
-  return resampled.map(p => ({ x: p.x - cx, y: p.y - cy }));
-}
-
-function gaussianBlur(gray, w, h) {
-  // 5×5 Gaussian kernel (sigma ≈ 1)
-  const k = [1, 4, 6, 4, 1, 4, 16, 24, 16, 4, 6, 24, 36, 24, 6, 4, 16, 24, 16, 4, 1, 4, 6, 4, 1];
-  const result = new Float32Array(w * h);
-  for (let y = 2; y < h - 2; y++) {
-    for (let x = 2; x < w - 2; x++) {
-      let sum = 0, ki = 0;
-      for (let dy = -2; dy <= 2; dy++) {
-        for (let dx = -2; dx <= 2; dx++) {
-          sum += k[ki++] * gray[(y + dy) * w + (x + dx)];
-        }
-      }
-      result[y * w + x] = sum / 256;
+    // Pick the longest contour — that's the main subject outline
+    let bestIdx = -1, bestLen = 0;
+    for (let i = 0; i < contours.size(); i++) {
+      const len = contours.get(i).rows;
+      if (len > bestLen) { bestLen = len; bestIdx = i; }
     }
-  }
-  return result;
-}
+    if (bestIdx === -1 || bestLen < 3) return [];
 
-function sobelMagnitude(gray, w, h) {
-  const mag = new Float32Array(w * h);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const gx =
-        -gray[(y - 1) * w + (x - 1)] - 2 * gray[y * w + (x - 1)] - gray[(y + 1) * w + (x - 1)]
-        + gray[(y - 1) * w + (x + 1)] + 2 * gray[y * w + (x + 1)] + gray[(y + 1) * w + (x + 1)];
-      const gy =
-        -gray[(y - 1) * w + (x - 1)] - 2 * gray[(y - 1) * w + x] - gray[(y - 1) * w + (x + 1)]
-        + gray[(y + 1) * w + (x - 1)] + 2 * gray[(y + 1) * w + x] + gray[(y + 1) * w + (x + 1)];
-      mag[y * w + x] = Math.sqrt(gx * gx + gy * gy);
+    const contour = contours.get(bestIdx);
+    const points = [];
+    for (let i = 0; i < contour.rows; i++) {
+      points.push({ x: contour.data32S[i * 2], y: contour.data32S[i * 2 + 1] });
     }
+
+    const resampled = resampleEvenly(points, MAX_POINTS);
+    const cx = resampled.reduce((s, p) => s + p.x, 0) / resampled.length;
+    const cy = resampled.reduce((s, p) => s + p.y, 0) / resampled.length;
+    return resampled.map(p => ({ x: p.x - cx, y: p.y - cy }));
+
+  } finally {
+    src?.delete();
+    gray?.delete();
+    blurred?.delete();
+    edges?.delete();
+    contours?.delete();
+    hierarchy?.delete();
   }
-  return mag;
 }
 
-// Find threshold such that ~targetCount pixels are above it
-function adaptiveThreshold(mag, targetCount) {
-  const vals = [];
-  for (let i = 0; i < mag.length; i++) {
-    if (mag[i] > 0) vals.push(mag[i]);
-  }
-  if (vals.length === 0) return 0;
-  vals.sort((a, b) => a - b);
-  const idx = Math.max(0, vals.length - targetCount);
-  return vals[idx];
-}
-
-// BFS flood-fill — returns a binary map containing only the largest
-// 8-connected component of edgeMap, discarding scattered noise pixels.
-function largestConnectedComponent(edgeMap, w, h) {
-  const visited = new Uint8Array(w * h);
-  let bestStart = -1, bestSize = 0;
-
-  for (let i = 0; i < w * h; i++) {
-    if (!edgeMap[i] || visited[i]) continue;
-    // BFS to measure component size
-    const queue = [i];
-    visited[i] = 1;
-    let size = 0;
-    while (queue.length > 0) {
-      const idx = queue.pop();
-      size++;
-      const y = Math.floor(idx / w), x = idx % w;
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          if (dy === 0 && dx === 0) continue;
-          const ny = y + dy, nx = x + dx;
-          if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
-          const ni = ny * w + nx;
-          if (edgeMap[ni] && !visited[ni]) { visited[ni] = 1; queue.push(ni); }
-        }
-      }
-    }
-    if (size > bestSize) { bestSize = size; bestStart = i; }
-  }
-
-  if (bestStart === -1) return new Uint8Array(w * h);
-
-  // Second BFS to collect the winning component
-  const result = new Uint8Array(w * h);
-  const visited2 = new Uint8Array(w * h);
-  const queue = [bestStart];
-  visited2[bestStart] = 1;
-  while (queue.length > 0) {
-    const idx = queue.pop();
-    result[idx] = 1;
-    const y = Math.floor(idx / w), x = idx % w;
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        if (dy === 0 && dx === 0) continue;
-        const ny = y + dy, nx = x + dx;
-        if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
-        const ni = ny * w + nx;
-        if (edgeMap[ni] && !visited2[ni]) { visited2[ni] = 1; queue.push(ni); }
-      }
-    }
-  }
-  return result;
-}
-
-// Sort edge pixels by angle from their centroid, turning the pixel set
-// into an ordered ring suitable for DFT.
-function sortByAngle(points) {
-  const cx = points.reduce((s, p) => s + p.x, 0) / points.length;
-  const cy = points.reduce((s, p) => s + p.y, 0) / points.length;
-  return [...points].sort(
-    (a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx)
-  );
-}
-
-// Pick N evenly-spaced points from a path array.
+// Pick n evenly-spaced points from an ordered path array
 function resampleEvenly(path, n) {
   if (path.length <= n) return path;
   const result = [];
@@ -275,7 +183,7 @@ function computeDFT(points) {
     re /= N;
     im /= N;
 
-    // Map k > N/2 to negative frequencies for nicer visualization
+    // Map k > N/2 to negative frequencies for a nicer visual (slow circles first)
     const freq = k <= N / 2 ? k : k - N;
 
     result.push({
@@ -299,88 +207,91 @@ function startAnimation() {
   animCtx.fillStyle = '#0d0d1a';
   animCtx.fillRect(0, 0, canvasW, canvasH);
 
-  timeStep = 0;
-  drawnPath = [];
-  dt = (2 * Math.PI) / TARGET_FRAMES;
+  // Pre-compute every point on the path before animation starts.
+  // N+1 samples: t = 0, 2π/N, 4π/N, ..., 2π  (last == first by DFT periodicity).
+  const N = frequencies.length;
+  const cx = canvasW / 2, cy = canvasH / 2;
+  const active = frequencies.slice(0, Math.min(numCircles, N));
+  precomputedPath = [];
+  for (let i = 0; i <= N; i++) {
+    const t = (2 * Math.PI * i) / N;
+    let x = cx, y = cy;
+    for (const f of active) {
+      x += f.amp * Math.cos(f.freq * t + f.phase);
+      y += f.amp * Math.sin(f.freq * t + f.phase);
+    }
+    precomputedPath.push({ x, y, t });
+  }
 
+  animFrame = 0;
+  stepsAccumulator = 0;
   startBtn.disabled = true;
   resetBtn.disabled = false;
-  setStatus('Animating...');
-
+  setStatus('Animating…');
   drawFrame();
 }
 
 function drawFrame() {
-  const cx = canvasW / 2;
-  const cy = canvasH / 2;
+  const total = precomputedPath.length; // N+1
+  const active = frequencies.slice(0, Math.min(numCircles, frequencies.length));
 
-  // Clear frame
+  // Advance frame counter. Base rate: ~300 frames per full cycle at speed=1.
+  stepsAccumulator += (total / 300) * speed;
+  const steps = Math.floor(stepsAccumulator);
+  stepsAccumulator -= steps;
+  animFrame = Math.min(animFrame + steps, total - 1);
+
+  const done = animFrame >= total - 1;
+
+  // Clear
   animCtx.fillStyle = '#0d0d1a';
   animCtx.fillRect(0, 0, canvasW, canvasH);
 
-  // Draw accumulated path so far
-  if (drawnPath.length > 1) {
+  // Draw the revealed portion of the path
+  if (animFrame > 0) {
     animCtx.beginPath();
-    animCtx.moveTo(drawnPath[0].x, drawnPath[0].y);
-    for (let i = 1; i < drawnPath.length; i++) {
-      animCtx.lineTo(drawnPath[i].x, drawnPath[i].y);
+    animCtx.moveTo(precomputedPath[0].x, precomputedPath[0].y);
+    for (let i = 1; i <= animFrame; i++) {
+      animCtx.lineTo(precomputedPath[i].x, precomputedPath[i].y);
     }
     animCtx.strokeStyle = '#ff6b6b';
     animCtx.lineWidth = 1.5;
     animCtx.stroke();
   }
 
-  // Draw epicycles
-  const active = frequencies.slice(0, Math.min(numCircles, frequencies.length));
-  let x = cx, y = cy;
+  // Draw epicycle chain at the current tip
+  if (!done) {
+    const t = precomputedPath[animFrame].t;
+    let x = canvasW / 2, y = canvasH / 2;
+    for (const f of active) {
+      const prevX = x, prevY = y;
+      x += f.amp * Math.cos(f.freq * t + f.phase);
+      y += f.amp * Math.sin(f.freq * t + f.phase);
 
-  for (const f of active) {
-    const prevX = x, prevY = y;
-    const angle = f.freq * timeStep + f.phase;
-    x += f.amp * Math.cos(angle);
-    y += f.amp * Math.sin(angle);
-
-    if (f.amp > 1) {
+      if (f.amp > 1) {
+        animCtx.beginPath();
+        animCtx.arc(prevX, prevY, f.amp, 0, 2 * Math.PI);
+        animCtx.strokeStyle = 'rgba(100, 200, 255, 0.18)';
+        animCtx.lineWidth = 0.5;
+        animCtx.stroke();
+      }
       animCtx.beginPath();
-      animCtx.arc(prevX, prevY, f.amp, 0, 2 * Math.PI);
-      animCtx.strokeStyle = 'rgba(100, 200, 255, 0.18)';
-      animCtx.lineWidth = 0.5;
+      animCtx.moveTo(prevX, prevY);
+      animCtx.lineTo(x, y);
+      animCtx.strokeStyle = 'rgba(180, 230, 255, 0.65)';
+      animCtx.lineWidth = 1;
       animCtx.stroke();
     }
 
     animCtx.beginPath();
-    animCtx.moveTo(prevX, prevY);
-    animCtx.lineTo(x, y);
-    animCtx.strokeStyle = 'rgba(180, 230, 255, 0.65)';
-    animCtx.lineWidth = 1;
-    animCtx.stroke();
+    animCtx.arc(x, y, 2.5, 0, 2 * Math.PI);
+    animCtx.fillStyle = '#ff6b6b';
+    animCtx.fill();
   }
 
-  // Dot at tip
-  animCtx.beginPath();
-  animCtx.arc(x, y, 2.5, 0, 2 * Math.PI);
-  animCtx.fillStyle = '#ff6b6b';
-  animCtx.fill();
-
-  drawnPath.push({ x, y });
-  timeStep += dt * speed;
-
-  if (timeStep < 2 * Math.PI) {
+  if (!done) {
     animationId = requestAnimationFrame(drawFrame);
   } else {
-    // Close and finalize the path
-    animCtx.fillStyle = '#0d0d1a';
-    animCtx.fillRect(0, 0, canvasW, canvasH);
-    animCtx.beginPath();
-    animCtx.moveTo(drawnPath[0].x, drawnPath[0].y);
-    for (let i = 1; i < drawnPath.length; i++) {
-      animCtx.lineTo(drawnPath[i].x, drawnPath[i].y);
-    }
-    animCtx.closePath();
-    animCtx.strokeStyle = '#ff6b6b';
-    animCtx.lineWidth = 1.5;
-    animCtx.stroke();
-
     animationId = null;
     startBtn.disabled = false;
     setStatus('Done! Adjust circles or speed and click Start to replay.');
@@ -388,12 +299,9 @@ function drawFrame() {
 }
 
 function resetAnimation() {
-  if (animationId) {
-    cancelAnimationFrame(animationId);
-    animationId = null;
-  }
-  drawnPath = [];
-  timeStep = 0;
+  if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
+  precomputedPath = [];
+  animFrame = 0;
   animCtx.fillStyle = '#0d0d1a';
   animCtx.fillRect(0, 0, canvasW, canvasH);
   startBtn.disabled = false;
